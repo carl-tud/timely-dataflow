@@ -13,6 +13,8 @@ impl Default for Buzzer {
 }
 
 impl Buzzer {
+    /// ....
+    pub fn thread_id(&self) -> std::thread::ThreadId {self.thread.id()}
     /// Unparks the target thread.
     pub fn buzz(&self) {
         self.thread.unpark()

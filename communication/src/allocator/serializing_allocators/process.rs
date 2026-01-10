@@ -10,9 +10,9 @@ use timely_bytes::arc::Bytes;
 use crate::networking::MessageHeader;
 
 use crate::{Allocate, Push, Pull};
-use crate::allocator::{AllocateBuilder, Exchangeable, PeerBuilder};
+use crate::allocator::{AllocatorBuilder, Exchangeable, PeerBuilder};
 use crate::allocator::canary::Canary;
-use crate::allocator::zero_copy::bytes_slab::BytesRefill;
+use crate::allocator::serializing_allocators::bytes_slab::BytesRefill;
 use super::bytes_exchange::{BytesPull, SendEndpoint, MergeQueue};
 
 use super::push_pull::{Pusher, Puller};
@@ -23,7 +23,7 @@ use super::push_pull::{Pusher, Puller};
 /// threads (specifically, the `Rc<RefCell<_>>` local channels). So, we must package up the state
 /// shared between threads here, and then provide a method that will instantiate the non-movable
 /// members once in the destination thread.
-pub struct ProcessBuilder {
+pub struct IntraProcessSerializingAllocatorBuilder {
     index:  usize,                      // number out of peers
     peers:  usize,                      // number of peer allocators.
     pushers: Vec<Receiver<MergeQueue>>, // for pushing bytes at other workers.
@@ -31,12 +31,12 @@ pub struct ProcessBuilder {
     refill: BytesRefill,
 }
 
-impl PeerBuilder for ProcessBuilder {
-    type Peer = ProcessBuilder;
+impl PeerBuilder for IntraProcessSerializingAllocatorBuilder {
+    type Peer = IntraProcessSerializingAllocatorBuilder;
     /// Creates a vector of builders, sharing appropriate state.
     ///
     /// This method requires access to a byte exchanger, from which it mints channels.
-    fn new_vector(count: usize, refill: BytesRefill) -> Vec<ProcessBuilder> {
+    fn new_vector(count: usize, refill: BytesRefill) -> Vec<IntraProcessSerializingAllocatorBuilder> {
 
         // Channels for the exchange of `MergeQueue` endpoints.
         let (pullers_vec, pushers_vec) = crate::promise_futures(count, count);
@@ -46,7 +46,7 @@ impl PeerBuilder for ProcessBuilder {
             .zip(pullers_vec)
             .enumerate()
             .map(|(index, (pushers, pullers))|
-                ProcessBuilder {
+                IntraProcessSerializingAllocatorBuilder {
                     index,
                     peers: count,
                     pushers,
@@ -58,9 +58,9 @@ impl PeerBuilder for ProcessBuilder {
     }
 }
 
-impl ProcessBuilder {
+impl IntraProcessSerializingAllocatorBuilder {
     /// Builds a `ProcessAllocator`, instantiating `Rc<RefCell<_>>` elements.
-    pub fn build(self) -> ProcessAllocator {
+    pub fn build(self) -> IntraProcessSerializingAllocator {
 
         // Fulfill puller obligations.
         let mut recvs = Vec::with_capacity(self.peers);
@@ -79,7 +79,7 @@ impl ProcessBuilder {
             sends.push(Rc::new(RefCell::new(sendpoint)));
         }
 
-        ProcessAllocator {
+        IntraProcessSerializingAllocator {
             index: self.index,
             peers: self.peers,
             events: Rc::new(RefCell::new(Default::default())),
@@ -93,8 +93,8 @@ impl ProcessBuilder {
     }
 }
 
-impl AllocateBuilder for ProcessBuilder {
-    type Allocator = ProcessAllocator;
+impl AllocatorBuilder for IntraProcessSerializingAllocatorBuilder {
+    type Allocator = IntraProcessSerializingAllocator;
     /// Builds allocator, consumes self.
     fn build(self) -> Self::Allocator {
         self.build()
@@ -103,7 +103,7 @@ impl AllocateBuilder for ProcessBuilder {
 }
 
 /// A serializing allocator for inter-thread intra-process communication.
-pub struct ProcessAllocator {
+pub struct IntraProcessSerializingAllocator {
 
     index:      usize,                              // number out of peers
     peers:      usize,                              // number of peer allocators (for typed channel allocation).
@@ -121,11 +121,10 @@ pub struct ProcessAllocator {
     to_local:   HashMap<usize, Rc<RefCell<VecDeque<Bytes>>>>,          // to worker-local typed pullers.
 }
 
-impl Allocate for ProcessAllocator {
+impl Allocate for IntraProcessSerializingAllocator {
     fn index(&self) -> usize { self.index }
     fn peers(&self) -> usize { self.peers }
     fn allocate<T: Exchangeable>(&mut self, identifier: usize) -> (Vec<Box<dyn Push<T>>>, Box<dyn Pull<T>>) {
-
         // Assume and enforce in-order identifier allocation.
         if let Some(bound) = self.channel_id_bound {
             assert!(bound < identifier);

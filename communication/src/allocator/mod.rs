@@ -4,9 +4,9 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::time::Duration;
 
-pub use self::thread::Thread;
-pub use self::process::Process;
-pub use self::generic::{Generic, GenericBuilder};
+pub use self::thread::IntraThreadAllocator;
+pub use self::process::IntraProcessAllocator;
+pub use self::generic::{GenericAllocator, GenericBuilder};
 
 pub mod thread;
 pub mod process;
@@ -15,7 +15,7 @@ pub mod generic;
 pub mod canary;
 pub mod counters;
 
-pub mod zero_copy;
+pub mod serializing_allocators;
 
 use crate::{Bytesable, Push, Pull};
 
@@ -25,7 +25,7 @@ use crate::{Bytesable, Push, Pull};
 /// the `Send` trait, for example `Rc` wrappers for shared state. As such, what we
 /// actually need to create to initialize a computation are builders, which we can
 /// then move into new threads each of which then construct their actual allocator.
-pub trait AllocateBuilder : Send {
+pub trait AllocatorBuilder : Send {
     /// The type of allocator to be built.
     type Allocator: Allocate;
     /// Builds allocator, consumes self.
@@ -94,7 +94,7 @@ pub trait Allocate {
         (thread::ThreadPusher<T>,
          thread::ThreadPuller<T>)
     {
-        thread::Thread::new_from(identifier, Rc::clone(self.events()))
+        thread::IntraThreadAllocator::new_from(identifier, Rc::clone(self.events()))
     }
 
     /// Allocates a broadcast channel, where each pushed message is received by all.
@@ -126,12 +126,12 @@ impl<T: Clone> Push<T> for Broadcaster<T> {
     }
 }
 
-use crate::allocator::zero_copy::bytes_slab::BytesRefill;
+use crate::allocator::serializing_allocators::bytes_slab::BytesRefill;
 
 /// A builder for vectors of peers.
 pub trait PeerBuilder {
     /// The peer type.
-    type Peer: AllocateBuilder + Sized;
+    type Peer: AllocatorBuilder + Sized;
     /// Allocate a list of `Self::Peer` of length `peers`.
     fn new_vector(peers: usize, refill: BytesRefill) -> Vec<Self::Peer>;
 }

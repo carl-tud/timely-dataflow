@@ -27,6 +27,17 @@ serde = { version = "1.0", features = ["derive"] }
 timely_bytes = { path = "../bytes", version = "0.25" }
 timely_container = { path = "../container", version = "0.25.1" }
 timely_logging = { path = "../logging", version = "0.25" }
+quinn = "0.11.9"
+futures = "0.3.31"
+rcgen = "0.14.6"
+rustls = { version = "0.23.35" }
+tokio = { version = "1.49.0", features = ["full", "rt-multi-thread"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tokio-rustls = "0.26.4"
+gm-quic = "0.4.0"
+s2n-quic = { version = "1.72.0", features = ["provider-tls-rustls"] }
+iceoryx2 = "0.8.0"
 
 # Lgalloc only supports linux and macos, don't depend on any other OS.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]

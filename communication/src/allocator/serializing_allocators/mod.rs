@@ -10,9 +10,6 @@
 
 pub mod bytes_slab;
 pub mod bytes_exchange;
-pub mod tcp;
-pub mod allocator;
-pub mod allocator_process;
-pub mod initialize;
+pub mod cluster; // Intra-cluster serializing TCP communication allocator
+pub mod process; // Intra-process serializing communicaton allocator
 pub mod push_pull;
-pub mod stream;

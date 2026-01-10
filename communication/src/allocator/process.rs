@@ -8,14 +8,14 @@ use std::time::Duration;
 use std::collections::{HashMap};
 use std::sync::mpsc::{Sender, Receiver};
 
-use crate::allocator::thread::{ThreadBuilder};
-use crate::allocator::{Allocate, AllocateBuilder, PeerBuilder, Thread};
+use crate::allocator::thread::{IntraThreadAllocatorBuilder};
+use crate::allocator::{Allocate, AllocatorBuilder, PeerBuilder, IntraThreadAllocator};
 use crate::{Push, Pull};
 use crate::buzzer::Buzzer;
 
 /// An allocator for inter-thread, intra-process communication
-pub struct ProcessBuilder {
-    inner: ThreadBuilder,
+pub struct IntraProcessAllocatorBuilder {
+    inner: IntraThreadAllocatorBuilder,
     index: usize,
     peers: usize,
     // below: `Box<Any+Send>` is a `Box<Vec<Option<(Vec<Sender<T>>, Receiver<T>)>>>`
@@ -29,8 +29,8 @@ pub struct ProcessBuilder {
     counters_recv: Receiver<usize>,
 }
 
-impl AllocateBuilder for ProcessBuilder {
-    type Allocator = Process;
+impl AllocatorBuilder for IntraProcessAllocatorBuilder {
+    type Allocator = IntraProcessAllocator;
     fn build(self) -> Self::Allocator {
 
         // Initialize buzzers; send first, then recv.
@@ -43,7 +43,7 @@ impl AllocateBuilder for ProcessBuilder {
             buzzers.push(worker.recv().expect("Failed to recv buzzer"));
         }
 
-        Process {
+        IntraProcessAllocator {
             inner: self.inner.build(),
             index: self.index,
             peers: self.peers,
@@ -56,26 +56,28 @@ impl AllocateBuilder for ProcessBuilder {
 }
 
 /// An allocator for inter-thread, intra-process communication
-pub struct Process {
-    inner: Thread,
+pub struct IntraProcessAllocator {
+    inner: IntraThreadAllocator,
     index: usize,
     peers: usize,
     // below: `Box<Any+Send>` is a `Box<Vec<Option<(Vec<Sender<T>>, Receiver<T>)>>>`
     channels: Arc<Mutex<HashMap</* channel id */ usize, Box<dyn Any+Send>>>>,
+
+    /// Thread buzzers for notifying threads in this process
     buzzers: Vec<Buzzer>,
     counters_send: Vec<Sender<usize>>,
     counters_recv: Receiver<usize>,
 }
 
-impl Process {
+impl IntraProcessAllocator {
     /// Access the wrapped inner allocator.
-    pub fn inner(&mut self) -> &mut Thread { &mut self.inner }
+    pub fn inner(&mut self) -> &mut IntraThreadAllocator { &mut self.inner }
 }
 
-impl PeerBuilder for Process {
-    type Peer = ProcessBuilder;
+impl PeerBuilder for IntraProcessAllocator {
+    type Peer = IntraProcessAllocatorBuilder;
     /// Allocate a list of connected intra-process allocators.
-    fn new_vector(peers: usize, _refill: crate::allocator::BytesRefill) -> Vec<ProcessBuilder> {
+    fn new_vector(peers: usize, _refill: crate::allocator::BytesRefill) -> Vec<IntraProcessAllocatorBuilder> {
 
         let mut counters_send = Vec::with_capacity(peers);
         let mut counters_recv = Vec::with_capacity(peers);
@@ -96,8 +98,8 @@ impl PeerBuilder for Process {
             .zip(buzzers_recv)
             .enumerate()
             .map(|(index, ((recv, bsend), brecv))| {
-                ProcessBuilder {
-                    inner: ThreadBuilder,
+                IntraProcessAllocatorBuilder {
+                    inner: IntraThreadAllocatorBuilder,
                     index,
                     peers,
                     buzzers_send: bsend,
@@ -111,7 +113,7 @@ impl PeerBuilder for Process {
     }
 }
 
-impl Allocate for Process {
+impl Allocate for IntraProcessAllocator {
     fn index(&self) -> usize { self.index }
     fn peers(&self) -> usize { self.peers }
     fn allocate<T: Any+Send>(&mut self, identifier: usize) -> (Vec<Box<dyn Push<T>>>, Box<dyn Pull<T>>) {

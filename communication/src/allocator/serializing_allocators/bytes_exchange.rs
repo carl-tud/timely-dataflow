@@ -33,7 +33,9 @@ pub struct MergeQueue {
     panic: Arc<AtomicBool>,
 }
 
-impl MergeQueue {
+impl MergeQueue { 
+    /// ...
+    pub fn buzzer_id(&self) -> std::thread::ThreadId {self.buzzer.thread_id()}
     /// Allocates a new queue with an associated signal.
     pub fn new(buzzer: crate::buzzer::Buzzer) -> Self {
         MergeQueue {
@@ -51,7 +53,6 @@ impl MergeQueue {
 
 impl BytesPush for MergeQueue {
     fn extend<I: IntoIterator<Item=Bytes>>(&mut self, iterator: I) {
-
         if self.panic.load(Ordering::SeqCst) { panic!("MergeQueue poisoned."); }
 
         // try to acquire lock without going to sleep (Rust's lock() might yield)

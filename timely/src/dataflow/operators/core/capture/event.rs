@@ -137,7 +137,7 @@ pub mod binary {
     use std::sync::Arc;
 
     use serde::{de::DeserializeOwned, Serialize};
-    use timely_communication::allocator::zero_copy::bytes_slab::{BytesRefill, BytesSlab};
+    use timely_communication::allocator::serializing_allocators::bytes_slab::{BytesRefill, BytesSlab};
 
     use super::{Event, EventPusher, EventIterator};
 

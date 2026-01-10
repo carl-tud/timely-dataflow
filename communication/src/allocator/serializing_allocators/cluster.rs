@@ -9,9 +9,9 @@ use timely_bytes::arc::Bytes;
 use crate::networking::MessageHeader;
 
 use crate::{Allocate, Push, Pull};
-use crate::allocator::{AllocateBuilder, Exchangeable};
+use crate::allocator::{AllocatorBuilder, Exchangeable};
 use crate::allocator::canary::Canary;
-use crate::allocator::zero_copy::bytes_slab::BytesRefill;
+use crate::allocator::serializing_allocators::bytes_slab::BytesRefill;
 use super::bytes_exchange::{BytesPull, SendEndpoint, MergeQueue};
 use super::push_pull::{Pusher, PullerInner};
 
@@ -21,11 +21,11 @@ use super::push_pull::{Pusher, PullerInner};
 /// threads (specifically, the `Rc<RefCell<_>>` local channels). So, we must package up the state
 /// shared between threads here, and then provide a method that will instantiate the non-movable
 /// members once in the destination thread.
-pub struct TcpBuilder<A: AllocateBuilder> {
+pub struct IntraClusterAllocatorBuilder<A: AllocatorBuilder> {
     inner:  A,
     index:  usize,                      // number out of peers
     peers:  usize,                      // number of peer allocators.
-    futures:   Vec<Receiver<MergeQueue>>,  // to receive queues to each network thread.
+    futures:   Vec<Receiver<(MergeQueue, Option<BytesRefill>)>>,  // to receive queues to each network thread.
     promises:   Vec<Sender<MergeQueue>>,    // to send queues from each network thread.
     /// Byte slab refill function.
     refill: BytesRefill,
@@ -43,20 +43,22 @@ pub struct TcpBuilder<A: AllocateBuilder> {
 ///   info to spawn ingress comm thresds,
 /// )
 /// ```
-pub fn new_vector<A: AllocateBuilder>(
+pub fn new_vector<A: AllocatorBuilder>(
     allocators: Vec<A>,
     my_process: usize,
     processes: usize,
+    network_senders: usize,
+    network_receivers: usize,
     refill: BytesRefill,
-) -> (Vec<TcpBuilder<A>>,
-    Vec<Vec<Sender<MergeQueue>>>,
+) -> (Vec<IntraClusterAllocatorBuilder<A>>,
+    Vec<Vec<Sender<(MergeQueue, Option<BytesRefill>)>>>,
     Vec<Vec<Receiver<MergeQueue>>>)
 {
     let threads = allocators.len();
 
     // For queues from worker threads to network threads, and vice versa.
-    let (network_promises, worker_futures) = crate::promise_futures(processes-1, threads);
-    let (worker_promises, network_futures) = crate::promise_futures(threads, processes-1);
+    let (network_promises, worker_futures) = crate::promise_futures(network_senders, threads);
+    let (worker_promises, network_futures) = crate::promise_futures(threads, network_receivers);
 
     let builders =
     allocators
@@ -65,7 +67,7 @@ pub fn new_vector<A: AllocateBuilder>(
         .zip(worker_futures)
         .enumerate()
         .map(|(index, ((inner, promises), futures))| {
-            TcpBuilder {
+            IntraClusterAllocatorBuilder {
                 inner,
                 index: my_process * threads + index,
                 peers: threads * processes,
@@ -78,10 +80,10 @@ pub fn new_vector<A: AllocateBuilder>(
     (builders, network_promises, network_futures)
 }
 
-impl<A: AllocateBuilder> TcpBuilder<A> {
-
+impl<A: AllocatorBuilder> AllocatorBuilder for IntraClusterAllocatorBuilder<A> {
+    type Allocator = IntraClusterAllocator<A::Allocator>;
     /// Builds a `TcpAllocator`, instantiating `Rc<RefCell<_>>` elements.
-    pub fn build(self) -> TcpAllocator<A::Allocator> {
+    fn build(self) -> IntraClusterAllocator<A::Allocator> {
 
         // Fulfill puller obligations.
         let mut recvs = Vec::with_capacity(self.peers);
@@ -95,15 +97,15 @@ impl<A: AllocateBuilder> TcpBuilder<A> {
         // Extract pusher commitments.
         let mut sends = Vec::with_capacity(self.peers);
         for pusher in self.futures.into_iter() {
-            let queue = pusher.recv().expect("Failed to receive push queue");
-            let sendpoint = SendEndpoint::new(queue, self.refill.clone());
+            let (queue, refill) = pusher.recv().expect("Failed to receive push queue");
+            let sendpoint = SendEndpoint::new(queue, refill.unwrap_or_else(|| self.refill.clone()));
             sends.push(Rc::new(RefCell::new(sendpoint)));
         }
 
         // let sends: Vec<_> = self.sends.into_iter().map(
         //     |send| Rc::new(RefCell::new(SendEndpoint::new(send)))).collect();
 
-        TcpAllocator {
+        IntraClusterAllocator {
             inner: self.inner.build(),
             index: self.index,
             peers: self.peers,
@@ -118,7 +120,7 @@ impl<A: AllocateBuilder> TcpBuilder<A> {
 }
 
 /// A TCP-based allocator for inter-process communication.
-pub struct TcpAllocator<A: Allocate> {
+pub struct IntraClusterAllocator<A: Allocate> {
 
     inner:      A,                                  // A non-serialized inner allocator for process-local peers.
 
@@ -136,11 +138,11 @@ pub struct TcpAllocator<A: Allocate> {
     to_local:   HashMap<usize, Rc<RefCell<VecDeque<Bytes>>>>,   // to worker-local typed pullers.
 }
 
-impl<A: Allocate> Allocate for TcpAllocator<A> {
+impl<A: Allocate> Allocate for IntraClusterAllocator<A> {
     fn index(&self) -> usize { self.index }
     fn peers(&self) -> usize { self.peers }
     fn allocate<T: Exchangeable>(&mut self, identifier: usize) -> (Vec<Box<dyn Push<T>>>, Box<dyn Pull<T>>) {
-
+        println!("intra-cluster communication channel: allocating");
         // Assume and enforce in-order identifier allocation.
         if let Some(bound) = self.channel_id_bound {
             assert!(bound < identifier);

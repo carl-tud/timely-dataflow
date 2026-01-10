@@ -17,6 +17,9 @@ pub struct BytesSlab {
     new_bytes:      BytesRefill,                // function to allocate new buffers.
 }
 
+unsafe impl Send for BytesSlab {}
+unsafe impl Sync for BytesSlab {}
+
 /// Ability to acquire and policy to retain byte buffers.
 #[derive(Clone)]
 pub struct BytesRefill {

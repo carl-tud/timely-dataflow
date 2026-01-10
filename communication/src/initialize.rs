@@ -1,5 +1,6 @@
 //! Initialization logic for a generic instance of the `Allocate` channel allocation trait.
 
+use std::str::FromStr;
 use std::thread;
 #[cfg(feature = "getopts")]
 use std::io::BufRead;
@@ -11,12 +12,43 @@ use std::ops::DerefMut;
 use getopts;
 use timely_logging::Logger;
 
-use crate::allocator::thread::ThreadBuilder;
-use crate::allocator::{AllocateBuilder, Process, Generic, GenericBuilder, PeerBuilder};
-use crate::allocator::zero_copy::allocator_process::ProcessBuilder;
-use crate::allocator::zero_copy::bytes_slab::BytesRefill;
-use crate::allocator::zero_copy::initialize::initialize_networking;
+use crate::Allocate;
+use crate::allocator::{AllocatorBuilder, GenericAllocator, GenericBuilder, PeerBuilder};
+use crate::allocator::thread::{IntraThreadAllocator, IntraThreadAllocatorBuilder};
+use crate::allocator::process::{IntraProcessAllocator, IntraProcessAllocatorBuilder};
+use crate::allocator::serializing_allocators::process::{IntraProcessSerializingAllocator, IntraProcessSerializingAllocatorBuilder};
+use crate::allocator::serializing_allocators::cluster::{IntraClusterAllocator, IntraClusterAllocatorBuilder};
+use crate::allocator::serializing_allocators::bytes_slab::BytesRefill;
+use crate::networking::tcp;
+use crate::networking::tls;
+use crate::networking::quic;
 use crate::logging::{CommunicationEventBuilder, CommunicationSetup};
+
+/// Possible configurations for the communication infrastructure.
+#[derive(Clone)]
+pub enum ClusterTransport {
+    /// Transmission Control Protocol (TCP) for communication between processes
+    TCP,
+
+    /// Transmission Control Protocol (TCP) with Transport Layer Security (TLS) 
+    /// for communication between processes
+    TLS, 
+
+    /// Quick UDP Internet Connections (QUIC) for communication between processes
+    QUIC,
+}
+
+impl FromStr for ClusterTransport {
+    type Err = &'static str;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "tcp" | "TCP" => Ok(Self::TCP),
+            "quic" | "QUIC" => Ok(Self::QUIC),
+            "tls" | "TLS" => Ok(Self::TLS),
+            _ => Err("Unknown cluster transport identifier")
+        }
+    }
+}
 
 /// Possible configurations for the communication infrastructure.
 #[derive(Clone)]
@@ -37,8 +69,18 @@ pub enum Config {
         addresses: Vec<String>,
         /// Verbosely report connection process
         report: bool,
-        /// Enable intra-process zero-copy
-        zerocopy: bool,
+        /// Enable intra-process zero-copy (between threads in the same process)
+        intra_process_zero_copy: bool,
+        /// Enable intra-host zero-copy (between processes on the same host)
+        intra_host_zero_copy: bool,
+        /// The network transport to use between processes
+        /// 
+        /// Workers threads in processes across hosts always rely on networking.
+        /// Workers threads in different processes on the same host communicate using
+        /// the given transports only if [`intra_host_zero_copy`] is false.
+        /// 
+        /// Currently, using TCP and enabling intra-host zero copy communication is not supported. 
+        transport: ClusterTransport,
         /// Closure to create a new logger for a communication thread
         log_fn: Arc<dyn Fn(CommunicationSetup) -> Option<Logger<CommunicationEventBuilder>> + Send + Sync>,
     }
@@ -50,13 +92,13 @@ impl Debug for Config {
             Config::Thread => write!(f, "Config::Thread()"),
             Config::Process(n) => write!(f, "Config::Process({})", n),
             Config::ProcessBinary(n) => write!(f, "Config::ProcessBinary({})", n),
-            Config::Cluster { threads, process, addresses, report, zerocopy, log_fn: _ } => f
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy, intra_host_zero_copy, transport, log_fn: _ } => f
                 .debug_struct("Config::Cluster")
                 .field("threads", threads)
                 .field("process", process)
                 .field("addresses", addresses)
                 .field("report", report)
-                .field("zerocopy", zerocopy)
+                .field("zerocopy", intra_process_zero_copy)
                 .finish_non_exhaustive()
         }
     }
@@ -78,8 +120,10 @@ impl Config {
         opts.optopt("p", "process", "identity of this process", "IDX");
         opts.optopt("n", "processes", "number of processes", "NUM");
         opts.optopt("h", "hostfile", "text file whose lines are process addresses", "FILE");
+        opts.optopt("t", "transport", "cluster transport", "tcp|quic");
         opts.optflag("r", "report", "reports connection progress");
         opts.optflag("z", "zerocopy", "enable zero-copy for intra-process communication");
+        opts.optflag("s", "sharedmemory", "enable zero-copy for intra-host communication using shared memory");
     }
 
     /// Instantiates a configuration based upon the parsed options in `matches`.
@@ -96,7 +140,9 @@ impl Config {
         let process = matches.opt_get_default("p", 0_usize).map_err(|e| e.to_string())?;
         let processes = matches.opt_get_default("n", 1_usize).map_err(|e| e.to_string())?;
         let report = matches.opt_present("report");
-        let zerocopy = matches.opt_present("zerocopy");
+        let intra_process_zero_copy = matches.opt_present("zerocopy");
+        let intra_host_zero_copy = matches.opt_present("sharedmemory");
+        let transport = matches.opt_get_default("transport", ClusterTransport::TCP)?;
 
         if processes > 1 {
             let mut addresses = Vec::new();
@@ -122,11 +168,13 @@ impl Config {
                 process,
                 addresses,
                 report,
-                zerocopy,
+                intra_process_zero_copy,
+                intra_host_zero_copy,
+                transport,
                 log_fn: Arc::new(|_| None),
             })
         } else if threads > 1 {
-            if zerocopy {
+            if intra_process_zero_copy {
                 Ok(Config::ProcessBinary(threads))
             } else {
                 Ok(Config::Process(threads))
@@ -163,30 +211,63 @@ impl Config {
     pub fn try_build_with(self, refill: BytesRefill) -> Result<(Vec<GenericBuilder>, Box<dyn Any+Send>), String> {
         match self {
             Config::Thread => {
-                Ok((vec![GenericBuilder::Thread(ThreadBuilder)], Box::new(())))
+                Ok((vec![GenericBuilder::IntraThread(IntraThreadAllocatorBuilder)], Box::new(())))
             },
             Config::Process(threads) => {
-                Ok((Process::new_vector(threads, refill).into_iter().map(GenericBuilder::Process).collect(), Box::new(())))
+                Ok((IntraProcessAllocator::new_vector(threads, refill).into_iter().map(GenericBuilder::IntraProcess).collect(), Box::new(())))
             },
             Config::ProcessBinary(threads) => {
-                Ok((ProcessBuilder::new_vector(threads, refill).into_iter().map(GenericBuilder::ProcessBinary).collect(), Box::new(())))
+                Ok((IntraProcessSerializingAllocatorBuilder::new_vector(threads, refill).into_iter().map(GenericBuilder::IntraProcessSerializing).collect(), Box::new(())))
             },
-            Config::Cluster { threads, process, addresses, report, zerocopy: false, log_fn } => {
-                match initialize_networking::<Process>(addresses, process, threads, report, refill, log_fn) {
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: false, intra_host_zero_copy, transport: ClusterTransport::TCP, log_fn } => {
+                match tcp::init::<IntraProcessAllocator>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
-                        Ok((stuff.into_iter().map(GenericBuilder::ZeroCopy).collect(), Box::new(guard)))
+                        Ok((stuff.into_iter().map(GenericBuilder::IntraClusterIntraProcess).collect(), Box::new(guard)))
                     },
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             },
-            Config::Cluster { threads, process, addresses, report, zerocopy: true, log_fn } => {
-                match initialize_networking::<ProcessBuilder>(addresses, process, threads, report, refill, log_fn) {
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: true, intra_host_zero_copy, transport: ClusterTransport::TCP,log_fn } => {
+                match tcp::init::<IntraProcessSerializingAllocatorBuilder>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
-                        Ok((stuff.into_iter().map(GenericBuilder::ZeroCopyBinary).collect(), Box::new(guard)))
+                        Ok((stuff.into_iter().map(GenericBuilder::IntraClusterIntraProcessSerializing).collect(), Box::new(guard)))
                     },
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             }
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: false, intra_host_zero_copy, transport: ClusterTransport::TLS, log_fn } => {
+                match tls::init::<IntraProcessAllocator>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
+                    Ok((stuff, guard)) => {
+                        Ok((stuff.into_iter().map(GenericBuilder::IntraClusterIntraProcess).collect(), Box::new(guard)))
+                    },
+                    Err(err) => Err(format!("failed to initialize networking: {}", err))
+                }
+            },
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: true, intra_host_zero_copy, transport: ClusterTransport::TLS,log_fn } => {
+                match tls::init::<IntraProcessSerializingAllocatorBuilder>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
+                    Ok((stuff, guard)) => {
+                        Ok((stuff.into_iter().map(GenericBuilder::IntraClusterIntraProcessSerializing).collect(), Box::new(guard)))
+                    },
+                    Err(err) => Err(format!("failed to initialize networking: {}", err))
+                }
+            }
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: false, intra_host_zero_copy, transport: ClusterTransport::QUIC, log_fn } => {
+                match quic::init::<IntraProcessAllocator>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
+                    Ok((stuff, guard)) => {
+                        Ok((stuff.into_iter().map(GenericBuilder::IntraClusterIntraProcess).collect(), Box::new(guard)))
+                    },
+                    Err(err) => Err(format!("failed to initialize networking: {}", err))
+                }
+            }
+            Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: true, intra_host_zero_copy, transport: ClusterTransport::QUIC, log_fn } => {
+                match quic::init::<IntraProcessSerializingAllocatorBuilder>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
+                    Ok((stuff, guard)) => {
+                        Ok((stuff.into_iter().map(GenericBuilder::IntraClusterIntraProcessSerializing).collect(), Box::new(guard)))
+                    },
+                    Err(err) => Err(format!("failed to initialize networking: {}", err))
+                }
+            }
+            _ => Err(format!("unsupported cluster configuration"))
         }
     }
 }
@@ -277,7 +358,7 @@ impl Config {
 /// result: Ok(0)
 /// result: Ok(1)
 /// ```
-pub fn initialize<T:Send+'static, F: Fn(Generic)->T+Send+Sync+'static>(
+pub fn initialize<T:Send+'static, F: Fn(GenericAllocator)->T+Send+Sync+'static>(
     config: Config,
     func: F,
 ) -> Result<WorkerGuards<T>,String> {
@@ -363,9 +444,9 @@ pub fn initialize_from<A, T, F>(
     func: F,
 ) -> Result<WorkerGuards<T>,String>
 where
-    A: AllocateBuilder+'static,
+    A: AllocatorBuilder+'static,
     T: Send+'static,
-    F: Fn(<A as AllocateBuilder>::Allocator)->T+Send+Sync+'static
+    F: Fn(<A as AllocatorBuilder>::Allocator)->T+Send+Sync+'static
 {
     let logic = Arc::new(func);
     let mut guards = Vec::new();
