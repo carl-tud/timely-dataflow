@@ -162,6 +162,9 @@ impl<A: Allocate> Allocate for IntraClusterAllocator<A> {
             let mut process_id = target_index / inner_peers;
 
             if process_id == self.index / inner_peers {
+                // If this is a worker thread in our process,
+                // use the intra-thread/inter-process channel allocator
+                // to communicate with the worker thread.
                 pushes.push(inner_sends.remove(0));
             }
             else {

@@ -311,7 +311,7 @@ pub fn execute_from_args<I, T, F>(iter: I, func: F) -> Result<WorkerGuards<T>,St
 /// ```
 pub fn execute_from<A, T, F>(
     builders: Vec<A>,
-    others: Box<dyn ::std::any::Any+Send>,
+    others: Box<dyn ::std::any::Any>,
     worker_config: WorkerConfig,
     func: F,
 ) -> Result<WorkerGuards<T>, String>

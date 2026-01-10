@@ -37,7 +37,8 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 tokio-rustls = "0.26.4"
 gm-quic = "0.4.0"
 s2n-quic = { version = "1.72.0", features = ["provider-tls-rustls"] }
-iceoryx2 = "0.8.0"
+iceoryx2 = { version = "0.8.0", features = ["std"] }
+iceoryx2-bb-posix = "0.8.0"
 
 # Lgalloc only supports linux and macos, don't depend on any other OS.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dev-dependencies]

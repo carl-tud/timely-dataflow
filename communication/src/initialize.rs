@@ -199,8 +199,8 @@ impl Config {
     }
 
     /// Attempts to assemble the described communication infrastructure.
-    pub fn try_build(self) -> Result<(Vec<GenericBuilder>, Box<dyn Any+Send>), String> {
-        let refill = BytesRefill {
+    pub fn try_build(self) -> Result<(Vec<GenericBuilder>, Box<dyn Any>), String> {
+        let refill: BytesRefill = BytesRefill {
             logic: Arc::new(|size| Box::new(vec![0_u8; size]) as Box<dyn DerefMut<Target=[u8]>>),
             limit: None,
         };
@@ -208,7 +208,7 @@ impl Config {
     }
 
     /// Attempts to assemble the described communication infrastructure, using the supplied refill function.
-    pub fn try_build_with(self, refill: BytesRefill) -> Result<(Vec<GenericBuilder>, Box<dyn Any+Send>), String> {
+    pub fn try_build_with(self, refill: BytesRefill) -> Result<(Vec<GenericBuilder>, Box<dyn Any>), String> {
         match self {
             Config::Thread => {
                 Ok((vec![GenericBuilder::IntraThread(IntraThreadAllocatorBuilder)], Box::new(())))
@@ -440,7 +440,7 @@ pub fn initialize<T:Send+'static, F: Fn(GenericAllocator)->T+Send+Sync+'static>(
 /// ```
 pub fn initialize_from<A, T, F>(
     builders: Vec<A>,
-    others: Box<dyn Any+Send>,
+    others: Box<dyn Any>,
     func: F,
 ) -> Result<WorkerGuards<T>,String>
 where
@@ -465,9 +465,9 @@ where
 }
 
 /// Maintains `JoinHandle`s for worker threads.
-pub struct WorkerGuards<T:Send+'static> {
+pub struct WorkerGuards<T:'static> {
     guards: Vec<::std::thread::JoinHandle<T>>,
-    others: Box<dyn Any+Send>,
+    others: Box<dyn Any>,
 }
 
 impl<T:Send+'static> WorkerGuards<T> {
@@ -478,7 +478,7 @@ impl<T:Send+'static> WorkerGuards<T> {
     }
 
     /// Provides access to handles that are not worker threads.
-    pub fn others(&self) -> &Box<dyn Any+Send> {
+    pub fn others(&self) -> &Box<dyn Any> {
         &self.others
     }
 
@@ -491,7 +491,7 @@ impl<T:Send+'static> WorkerGuards<T> {
     }
 }
 
-impl<T:Send+'static> Drop for WorkerGuards<T> {
+impl<T:'static> Drop for WorkerGuards<T> {
     fn drop(&mut self) {
         for guard in self.guards.drain(..) {
             guard.join().expect("Worker panic");

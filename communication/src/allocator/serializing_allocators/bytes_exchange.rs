@@ -18,7 +18,7 @@ pub trait BytesPull {
     // /// Pulls bytes from the instance.
     // fn pull(&mut self) -> Option<Bytes>;
     /// Drains many bytes from the instance.
-    fn drain_into(&mut self, vec: &mut Vec<Bytes>);
+    fn drain_into<E: Extend<Bytes>>(&mut self, vec: &mut E);
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -93,7 +93,7 @@ impl BytesPush for MergeQueue {
 }
 
 impl BytesPull for MergeQueue {
-    fn drain_into(&mut self, vec: &mut Vec<Bytes>) {
+    fn drain_into<E: Extend<Bytes>>(&mut self, vec: &mut E) {
         if self.panic.load(Ordering::SeqCst) { panic!("MergeQueue poisoned."); }
 
         // try to acquire lock without going to sleep (Rust's lock() might yield)
@@ -102,7 +102,7 @@ impl BytesPull for MergeQueue {
             lock_ok = self.queue.try_lock();
         }
         let mut queue = lock_ok.expect("MergeQueue mutex poisoned.");
-
+        
         vec.extend(queue.drain(..));
     }
 }

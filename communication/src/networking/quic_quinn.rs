@@ -489,7 +489,7 @@ pub async fn send_loop(
     writer.flush().await
                 .unwrap_or_else(|e| quic_panic("flushing QUIC stream", e));
 
-    // let mut writer = tokio::io::BufWriter::with_capacity(1 << 16, writer);
+    let mut writer = tokio::io::BufWriter::with_capacity(1 << 16, writer);
     let mut stash = Vec::new();
 
     while !sources.is_empty() {
