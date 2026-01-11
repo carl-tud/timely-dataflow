@@ -153,22 +153,22 @@ async fn start_connections_quic(
                         Ok(conn) => {
                             let mut stream = conn.open_uni().await?;
                             stream.write_all(&(HANDSHAKE_MAGIC as u64).to_be_bytes()).await.expect("failed to send handshake magic");
-                            stream.write_all(&(my_index as u64).to_be_bytes()).await.expect("failed to send worker index");
+                            stream.write_all(&(my_index as u64).to_be_bytes()).await.expect("failed to send process index");
                             stream.finish()?;
                             // first_sessions.lock().unwrap().push(stream);
                             // TODO: maybe not finish stream here, use stream as broadcasting stream?
                             
-                            if noisy { println!("worker {}:\tconnected to {} (outgoing)", my_index, remote); }
+                            if noisy { println!("process {}:\tconnected to {} (outgoing)", my_index, remote); }
                             break conn;
                         }
                         Err(e) => {
-                            println!("worker {}:\tretrying connection to {} (outgoing): {}", my_index, remote, e);
+                            println!("process {}:\tretrying connection to {} (outgoing): {}", my_index, remote, e);
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 },
                 Err(e) => {
-                    println!("worker {}:\tretrying connection to {} (outgoing): {}", my_index, remote, e);
+                    println!("process {}:\tretrying connection to {} (outgoing): {}", my_index, remote, e);
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
@@ -206,9 +206,9 @@ async fn await_connections_quic(
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 "received incorrect timely handshake"));
         }
-        let identifier = cursor.read_u64::<ByteOrder>().expect("failed to decode worker index") as usize;
+        let identifier = cursor.read_u64::<ByteOrder>().expect("failed to decode process index") as usize;
         results[identifier - my_index - 1] = Some(connection);
-        if noisy { println!("worker {}:\tconnected to {} at {} (incoming)", my_index, identifier, addresses[identifier - my_index - 1]); }
+        if noisy { println!("process {}:\tconnected to {} at {} (incoming)", my_index, identifier, addresses[identifier - my_index - 1]); }
     }
 
     Ok(results.into_iter().flatten().collect())

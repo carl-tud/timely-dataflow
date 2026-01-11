@@ -169,10 +169,11 @@ pub mod util {
     //! be used automatically, without the driver for the per-process connection-oriented transport
     //! needing to be aware of this.
 
-    use std::{io::Write, net::ToSocketAddrs, sync::{Arc, OnceLock}, thread, time::Duration};
+    use std::{hash::{DefaultHasher, Hash, Hasher}, io::Write, net::ToSocketAddrs, sync::{Arc, OnceLock}, thread, time::Duration};
+    use columnar::Len;
     use iceoryx2_bb_posix::thread::ThreadBuilder;
     use timely_logging::Logger;
-    use iceoryx2::{port::{publisher::Publisher, subscriber::Subscriber}, prelude::{PortFactory, *}};
+    use iceoryx2::{port::{listener::Listener, notifier::Notifier, publisher::Publisher, reader::{EntryHandleError, Reader}, subscriber::Subscriber, writer::Writer}, prelude::{PortFactory, *}, service::builder::blackboard::{BlackboardCreateError, BlackboardOpenError}};
 
     use crate::{
         allocator::{
@@ -207,15 +208,24 @@ pub mod util {
         pub threads_per_process: usize,
     }
 
-    fn ipc_service_name(stable_process_discriminators: u16) -> String {
-        let mut s = stable_process_discriminators.to_string();
-        s.insert_str(0, "timely/inbox/");
-        s
+    fn ipc_inbox_name(stable_process_discriminator: u16) -> String {
+        format!("timely/inbox/{stable_process_discriminator}")
+    }
+
+    fn ipc_bell_name(stable_process_discriminator: u16) -> String {
+        format!("timely/bell/{stable_process_discriminator}")
+    }
+
+    fn ipc_assembly_name(name: &str) -> String {
+        format!("timely/assembly-{name}")
     }
 
     type Inbox = iceoryx2::service::port_factory::publish_subscribe::PortFactory<iceoryx2::service::ipc::Service, [u8], ()>;
+    type Bell = iceoryx2::service::port_factory::event::PortFactory<iceoryx2::service::ipc::Service>;
+    type AssemblySeat = usize;
+    type Assembly = iceoryx2::service::port_factory::blackboard::PortFactory<iceoryx2::service::ipc::Service, AssemblySeat>;
 
-    fn establish_ipc_service(node: &Node<ipc::Service>, name: &str, ipc_processes: usize) -> Inbox {
+    fn ipc_inbox(node: &Node<ipc::Service>, name: &str, ipc_processes: usize) -> Inbox {
         node
             .service_builder(&name.try_into().unwrap())
             .publish_subscribe::<[u8]>()
@@ -224,9 +234,25 @@ pub mod util {
             .max_nodes(ipc_processes)
             .max_subscribers(1)
             .max_publishers(ipc_processes - 1)
-            .history_size(100)
+            .history_size(0)
             .open_or_create()
-            .expect("failed to create IPC service for process")
+            .expect("failed to create IPC data service for process")
+    }
+
+    fn ipc_bell(node: &Node<ipc::Service>, name: &str, ipc_processes: usize) -> Bell {
+        node
+            .service_builder(&name.try_into().unwrap())
+            .event()
+            .max_nodes(ipc_processes)
+            .max_listeners(1)
+            .max_listeners(ipc_processes - 1)
+            .open_or_create()
+            .expect("failed to create IPC notifcation service for process")
+    }
+
+    fn ipc_service(node: &Node<ipc::Service>, discriminator: u16, ipc_processes: usize) -> (Inbox, Bell) {
+        (ipc_inbox(node, &ipc_inbox_name(discriminator), ipc_processes), 
+         ipc_bell(node, &ipc_bell_name(discriminator), ipc_processes))
     }
 
     fn publisher(inbox: Inbox) -> Publisher<ipc::Service, [u8], ()> {
@@ -235,7 +261,7 @@ pub mod util {
             .allocation_strategy(AllocationStrategy::BestFit)
             .max_loaned_samples(100)
             .create()
-            .expect("failed to create publishers to IPC inbox services")
+            .expect("failed to create publisher to IPC inbox service")
     }
 
     fn subscriber(inbox: Inbox) -> Subscriber<ipc::Service, [u8], ()> {
@@ -243,6 +269,60 @@ pub mod util {
             .subscriber_builder()
             .create()
             .expect("failed to subscribe to local process IPC inbox service")
+    }
+
+    fn notifier(bell: Bell) -> Notifier<ipc::Service> {
+        bell
+            .notifier_builder()
+            .create()
+            .expect("failed to create notifier for IPC notification service")
+    }
+
+    fn listener(bell: Bell) -> Listener<ipc::Service> {
+        bell
+            .listener_builder()
+            .create()
+            .expect("failed to listen to local process IPC notification service")
+    }
+
+    fn ipc_assembly(node: &Node<ipc::Service>, name: &str, ipc_processes: usize, seats: impl Iterator<Item=AssemblySeat>, create: bool) -> Result<Assembly, BlackboardOpenError> {
+        let builder = node
+            .service_builder(&name.try_into().unwrap());
+
+        if create {
+            let mut builder = builder
+                .blackboard_creator();
+
+            for seat in seats {
+                builder = builder.add(seat, false);
+            }
+
+            Ok(builder
+                .max_nodes(ipc_processes)
+                .max_readers(ipc_processes)
+                .create()
+                .expect("failed to create IPC assembly service"))
+        } else {
+            builder
+                .blackboard_opener()
+                .max_nodes(ipc_processes)
+                .max_readers(ipc_processes)
+                .open()
+        }
+    }
+
+    fn reader(assembly: &Assembly) -> Reader<ipc::Service, AssemblySeat> {
+        assembly
+            .reader_builder()
+            .create()
+            .expect("failed to create reader for IPC assembly service")
+    }
+
+    fn writer(assembly: &Assembly) -> Writer<ipc::Service, AssemblySeat> {
+        assembly
+            .writer_builder()
+            .create()
+            .expect("failed to create writer for IPC assembly service")
     }
 
     // Global storage for the runtime
@@ -268,6 +348,18 @@ pub mod util {
 
         /// Splits the network connection into the two parts
         fn split(self) -> std::io::Result<(Self::ReceiverHalf, Self::SenderHalf)>;
+    }
+
+    fn instance_hash<'a>(addressess: impl Iterator<Item=&'a std::net::SocketAddr>) -> u64 {
+        let mut s = DefaultHasher::new();
+        for addr in addressess {
+            if !addr.ip().is_loopback() {
+                addr.ip().hash(&mut s);
+            } else {
+                addr.port().hash(&mut s);
+            }
+        }
+        s.finish()
     }
 
     /// Allows the transport driver to connect to remote processes and wait for connections 
@@ -324,6 +416,7 @@ pub mod util {
                 .next()
                 .expect("failed to parse host address")
             ).collect();
+        let instance_hash = instance_hash(addresses.iter());
         
         let my_address = addresses[my_index];
         let my_stable_discriminator = my_address.port();
@@ -338,8 +431,171 @@ pub mod util {
                 }
             )
             .collect();
+        let my_process_id = addresses
+            .iter()
+            .enumerate()
+            .find(|(_, c)| matches!(c, ProcessConnection::LocalProcess))
+            .unwrap().0;
+        let processes = addresses.len();
 
-        // 1. Network connections
+        // Thread communication setup
+
+        let other_ipc_processes: Vec<_> = addresses.iter().enumerate().filter_map(|(i, addr)| 
+            if let ProcessConnection::IPC(stable_process_discriminator) = addr {
+                Some((i, *stable_process_discriminator))
+            } else { None }
+        ).collect();
+        
+        // We just need one receiver to receive from all other IPC processes, in contrast to the network case
+        let saved_network_receivers_ipc_to_net = 
+            if other_ipc_processes.is_empty() { 0 } else { other_ipc_processes.len() - 1 };
+        let process_allocators = P::new_vector(threads, refill.clone());
+        let (builders, promises, futures) = new_vector(
+            process_allocators, 
+            my_index, 
+            processes, 
+            // We are going to to spawn a sender reactor for every remote process.
+            // This is the number of queue arrays we need to read from in these reactors to send what
+            // we read into the network. In each queue array, there is a queue from each worker thread.
+            // [ WorkerOutlets, WorkerOutlets copy, WorkerOutlets copy 2, ... ]
+            // The order of the outles (array of queues) in the array of arry of queues
+            // does not matter. Each individual outlet is connected to the corresponding worker thread.
+            // In a sense, each outlet array (WorkerOutlets) in this array is just a (thread-safe) copy
+            // of the outlet of each worker.
+            // Note that the IntraClusterAllocator expects exactly the number of processes minus ourself.
+            processes - 1, 
+            // We are going to spawn a receiver reactor for every remote process, except for processes
+            // on this host, for which we only spawn a single receiver reactor in total (inbox system).
+            // This is the number of queue arrays we need to write from the reactors what we received
+            // from the network. In each queue array, there is a queue for each worker thread.
+            // [ WorkerInlets, WorkerInlets copy, WorkerInlets copy 2, ... ]
+            // The order of the inlets (array of queues) in the array of arry of queues
+            // does not matter. Each individual inlet is connected to the corresponding worker thread.
+            // In a sense, each inlet array (WorkerInlets) in this array is just a (thread-safe) copy
+            // of the inlet of each worker.
+            // Note that the IntraClusterAllocator does not care about the number of inlet replicatas
+            // per worker, i.e., the length of this array. This allows us the trick of using
+            // a single receive reactor for all IPC processes.
+            processes - 1 - saved_network_receivers_ipc_to_net, 
+            refill.clone()
+        );
+        let mut futures = futures.into_iter();
+        assert!(promises.len() - saved_network_receivers_ipc_to_net == futures.len());
+        assert!(promises.len() == addresses.len() - 1);
+
+        let mut send_guards: Vec<Box<dyn ThreadHandle<_>>> = Vec::with_capacity(processes - 1);
+        let mut recv_guards: Vec<Box<dyn ThreadHandle<_>>> = Vec::with_capacity(processes - 1 - saved_network_receivers_ipc_to_net);
+
+        // IPC
+        let (ipc_node, service, services) =
+        if !other_ipc_processes.is_empty() {
+            let node = NodeBuilder::new().create::<ipc::Service>().unwrap();
+
+            let service = ipc_service(
+                &node, 
+                my_stable_discriminator,
+                other_ipc_processes.len() + 1);
+
+            let services = other_ipc_processes.iter()
+                .map(|&(_, discriminator)| ipc_service(
+                    &node, 
+                    discriminator,
+                    other_ipc_processes.len() + 1
+                ))
+                .collect();
+
+            (Some(node), Some(service), services)
+        } else { 
+            (None, None, vec![])
+        };
+
+        // Very important: wait for all IPC processes on host. Then we wait for all remote networked processes.
+        // Only then this function returns. This ensures we don't measure time that is needed set up connections.
+        // We could do network connections first, but then the processes on hosts with no other IPC processes
+        // (i.e., they are pretty lonely on there) would already start sending and trying to receive data,
+        // while the other processes on hosts with other IPC processes are still stuck trying to set up
+        // their IPC.
+
+        // We need to wait for all other IPC processes so that we can set the IPC message history
+        // to zero. This means all IPC subscriber threads (one per process) must have subscribed to their inbox
+        // service. In practice, this means they must have entered the subscriber thread and have progressed
+        // just until the point where they hand over control to the kernel to get notified when the shared memory
+        // file changes.
+
+        if let (Some((inbox, bell)), Some(node)) = (service, ipc_node) {
+            let ipc_futures = futures.next().unwrap();
+            let info = ConnectionInfo {
+                local_process: my_index,
+                remote_process: my_index,
+                total_processes: addresses.len(),
+                threads_per_process: threads,
+            };
+
+            if noisy { println!("process {}:\tcreating thread timely:ipc:recv-inbox for host process", my_index); }
+
+            // Assembly is created by the process with the lowest index in the list
+            let create_assembly = my_index < other_ipc_processes.first().unwrap().0;
+            let name = ipc_assembly_name(&instance_hash.to_string());
+            let mut assembly = ipc_assembly(&node, &name, 
+                other_ipc_processes.len() + 1, 
+                other_ipc_processes.iter().map(|&(i, _)| i).chain(std::iter::once(my_index)),
+                create_assembly
+            );
+
+            if !create_assembly {
+                while assembly.is_err() {
+                    if noisy { println!("process {}:\twaiting for process {} to create assembly service {}", 
+                        my_index, other_ipc_processes.first().unwrap().0, name); }
+
+                    std::thread::sleep(Duration::from_millis(200));
+                    assembly = ipc_assembly(&node, &name, 
+                        other_ipc_processes.len() + 1, 
+                        other_ipc_processes.iter().map(|&(i, _)| i).chain(std::iter::once(my_index)),
+                        false
+                    )
+                }
+            }
+
+            if noisy { println!("process {}:\topened assembly service {}", my_index, name); }
+
+            let assembly = assembly.unwrap();
+            let reader = reader(&assembly);
+
+            let log_sender = Arc::clone(&log_sender);
+            let refill = refill.clone();
+            let alive_peers = other_ipc_processes.len();
+            let join_guard = std::thread::Builder::new()
+            // let join_guard = ThreadBuilder::new()
+                .name(format!("timely:ipc:recv-inbox"))
+                .spawn(move || {
+                    let logger = log_sender(CommunicationSetup {
+                        process: my_index,
+                        sender: false,
+                        remote: None,
+                    });
+
+                    ipc_receive_loop(
+                        ipc_futures, 
+                        subscriber(inbox), 
+                        listener(bell),
+                        assembly,
+                        info, logger, refill, alive_peers);
+                }).expect("failed to spawn recv-inbox thread");
+
+            for i in std::iter::once(my_index).chain(other_ipc_processes.iter().map(|&(i, _)| i)) {
+                if noisy { println!("process {}:\twaiting for process {} to become ready to receive", my_index, i); }
+                thread::sleep(Duration::from_nanos(100));
+                while !reader.entry::<bool>(&i)
+                    .map(|h| *h.get())
+                    .unwrap_or(false) {}
+                if noisy { println!("process {}:\tprocess {} is ready to receive", my_index, i); }
+            }
+
+            if noisy { println!("process {}:\tall IPC processes ready to receive", my_index); }
+            recv_guards.push(Box::new(join_guard));
+        }
+
+        // Network connections
 
         // Split all the networked processes in two groups:
         //  The ones with i < my_index accept a connection from this process
@@ -367,41 +623,8 @@ pub mod util {
             // connections to accepting processes, connections to connecting processes
             return (connected.join().unwrap(), accepted.join().unwrap());
         });
-
-        let network_connections = (network_connections.0?, network_connections.1?);
-
-        // 2. IPC
-
-        let other_ipc_processes: Vec<_> = addresses.iter().filter_map(|addr| 
-            if let ProcessConnection::IPC(stable_process_discriminator) = addr {
-                Some(*stable_process_discriminator)
-            } else { None }
-        ).collect();
-
-        let (ipc_node, inbox, inboxes) =
-        if !other_ipc_processes.is_empty() {
-            let node = NodeBuilder::new().create::<ipc::Service>().unwrap();
-
-            let inbox = establish_ipc_service(
-                &node, 
-                ipc_service_name(my_stable_discriminator).as_str(),
-                other_ipc_processes.len() + 1);
-
-            let inboxes = other_ipc_processes.iter()
-                .map(|&discriminator| establish_ipc_service(
-                    &node, 
-                    ipc_service_name(discriminator).as_str(),
-                    other_ipc_processes.len() + 1
-                ))
-                .collect();
-
-            (Some(node), Some(inbox), inboxes)
-        } else { 
-            (None, None, vec![])
-        };
-
-        let mut network_connections = network_connections.0.into_iter().chain(network_connections.1.into_iter());
-        let mut ipc_services = inboxes.into_iter();
+        let mut network_connections = network_connections.0?.into_iter().chain(network_connections.1?.into_iter());
+        let mut ipc_services = services.into_iter();
 
         let connections = addresses.iter()
             .enumerate()
@@ -418,98 +641,16 @@ pub mod util {
                 };
                 (i, c)
             });
-        
-
-        let processes = connections.len();
-
-        // We just need one receiver to receive from all other IPC processes, in contrast to the network case
-        let saved_network_receivers_ipc_to_net = 
-            if other_ipc_processes.is_empty() { 0 } else { other_ipc_processes.len() - 1 };
-        let process_allocators = P::new_vector(threads, refill.clone());
-        let (builders, promises, futures) = 
-            new_vector(
-                process_allocators, 
-                my_index, 
-                processes, 
-                // We are going to to spawn a sender reactor for every remote process.
-                // This is the number of queue arrays we need to read from in these reactors to send what
-                // we read into the network. In each queue array, there is a queue from each worker thread.
-                // [ WorkerOutlets, WorkerOutlets copy, WorkerOutlets copy 2, ... ]
-                // The order of the outles (array of queues) in the array of arry of queues
-                // does not matter. Each individual outlet is connected to the corresponding worker thread.
-                // In a sense, each outlet array (WorkerOutlets) in this array is just a (thread-safe) copy
-                // of the outlet of each worker.
-                // Note that the IntraClusterAllocator expects exactly the number of processes minus ourself.
-                processes - 1, 
-                // We are going to spawn a receiver reactor for every remote process, except for processes
-                // on this host, for which we only spawn a single receiver reactor in total (inbox system).
-                // This is the number of queue arrays we need to write from the reactors what we received
-                // from the network. In each queue array, there is a queue for each worker thread.
-                // [ WorkerInlets, WorkerInlets copy, WorkerInlets copy 2, ... ]
-                // The order of the inlets (array of queues) in the array of arry of queues
-                // does not matter. Each individual inlet is connected to the corresponding worker thread.
-                // In a sense, each inlet array (WorkerInlets) in this array is just a (thread-safe) copy
-                // of the inlet of each worker.
-                // Note that the IntraClusterAllocator does not care about the number of inlet replicatas
-                // per worker, i.e., the length of this array. This allows us the trick of using
-                // a single receive reactor for all IPC processes.
-                processes - 1 - saved_network_receivers_ipc_to_net, 
-                refill.clone());
-
-        assert!(promises.len() - saved_network_receivers_ipc_to_net == futures.len());
-        assert!(promises.len() == connections.len() - 1);
-
-        let mut send_guards: Vec<Box<dyn ThreadHandle<_>>> = Vec::with_capacity(connections.len());
-        let mut recv_guards: Vec<Box<dyn ThreadHandle<_>>> = Vec::with_capacity(connections.len());
-
-        let mut futures = futures.into_iter();
-
-        let my_process_id = addresses
-            .iter()
-            .enumerate()
-            .find(|(_, c)| matches!(c, ProcessConnection::LocalProcess))
-            .unwrap().0;
 
         let (net_connections, ipc_connections): (Vec<_>, Vec<_>) = connections
             .filter(|(_, connection)|
                 !matches!(connection, ProcessConnection::LocalProcess)) 
             .zip(promises.into_iter())
             .partition(|((_, c), _)| matches!(c, ProcessConnection::Network(_)));
-
-        if let (Some(inbox), Some(node)) = (inbox, ipc_node) {
-            let ipc_futures = futures.next().unwrap();
-            let info = ConnectionInfo {
-                local_process: my_index,
-                remote_process: my_index,
-                total_processes: addresses.len(),
-                threads_per_process: threads,
-            };
-
-            if noisy { println!("creating thread timely:ipc:recv-inbox for host process"); }
-            let log_sender = Arc::clone(&log_sender);
-            let refill = refill.clone();
-            let join_guard = std::thread::Builder::new()
-            // let join_guard = ThreadBuilder::new()
-                .name(format!("timely:ipc:recv-inbox"))
-                .spawn(move || {
-                    let logger = log_sender(CommunicationSetup {
-                        process: my_index,
-                        sender: false,
-                        remote: None,
-                    });
-                                        
-                    let targets: Vec<MergeQueue> = ipc_futures.into_iter()
-                        .map(|x| x.recv().expect("Failed to receive MergeQueue"))
-                        .collect();
-
-                    ipc_receive_loop(node, targets, subscriber(inbox), info, logger, refill, other_ipc_processes.len());
-                }).expect("failed to spawn recv-inbox thread");
-
-            recv_guards.push(Box::new(join_guard));
-        }
+        if noisy { println!("process {}:\testablished all ({} IPC, {} network) connections", my_index, ipc_connections.len(), net_connections.len()); }
 
         for ((i, connection), promises) in ipc_connections.into_iter() {
-            let ProcessConnection::IPC(inbox) = connection else {
+            let ProcessConnection::IPC((inbox, bell)) = connection else {
                 unreachable!("IPC connections filtered")
             };
             let info = ConnectionInfo {
@@ -519,7 +660,7 @@ pub mod util {
                 threads_per_process: threads,
             };
 
-            if noisy { println!("creating thread timely:ipc:send-{i} for host process {}", i); }
+            if noisy { println!("process {}:\tcreating thread timely:ipc:send-{i} for host process {}", my_index, i); }
             let log_sender = Arc::clone(&log_sender);
             // let join_guard = ThreadBuilder::new()
             let join_guard = std::thread::Builder::new()
@@ -537,7 +678,7 @@ pub mod util {
                         x.send((queue.clone(), None)).expect("failed to send MergeQueue");
                         queue
                     }).collect();
-                    ipc_send_loop(sources, publisher(inbox), info, logger);
+                    ipc_send_loop(sources, publisher(inbox), notifier(bell), info, logger);
                 }).expect("failed to spawn thread");
 
             send_guards.push(Box::new(join_guard));
@@ -556,7 +697,7 @@ pub mod util {
             
             let (receiver_half, sender_half) = connection.split()?;
             {
-                if noisy { println!("creating thread timely:net:send-{i} for remote process {}", i); }
+                if noisy { println!("process {}:\tcreating thread timely:net:send-{i} for remote process {}", my_index, i); }
                 let log_sender = Arc::clone(&log_sender);
                 let info = info.clone();
                 let join_guard = std::thread::Builder::new()
@@ -582,7 +723,7 @@ pub mod util {
             }
 
             {
-                if noisy {  println!("creating thread timely:net:recv-{i} for remote process {}", i); }
+                if noisy {  println!("process {}:\tcreating thread timely:net:recv-{i} for remote process {}", my_index, i); }
                 let log_sender = Arc::clone(&log_sender);
                 let refill = refill.clone();
                 let join_guard = std::thread::Builder::new()
@@ -609,9 +750,10 @@ pub mod util {
     }
 
     fn ipc_receive_loop(
-        node: Node<ipc::Service>,
-        mut targets: Vec<MergeQueue>,
+        targets: Vec<std::sync::mpsc::Receiver<MergeQueue>>,
         subscriber: Subscriber<ipc::Service, [u8], ()>,
+        listener: Listener<ipc::Service>,
+        assembly: Assembly,
         info: ConnectionInfo,
         logger_: Option<Logger<CommunicationEventBuilder>>,
         refill: BytesRefill,
@@ -626,6 +768,24 @@ pub mod util {
             start: true, 
         }));
 
+        let waitset = WaitSetBuilder::new()
+            .signal_handling_mode(SignalHandlingMode::HandleTerminationRequests)
+            .create::<ipc::Service>()
+            .unwrap_or_else(|e| ipc_panic("creating waitset", e));
+
+        let guard = waitset.attach_notification(&listener)
+            .unwrap_or_else(|e| ipc_panic("attaching listener", e));
+        let attachment_id = WaitSetAttachmentId::from_guard(&guard);
+
+        // Tell the others at the assembly that we are ready to receive.
+        writer(&assembly).entry::<bool>(&info.local_process)
+            .unwrap_or_else(|e| ipc_panic("IPC: retrieving assembly seat", e))
+            .update_with_copy(true);
+
+        let mut targets: Vec<MergeQueue> = targets.into_iter()
+            .map(|x| x.recv().expect("Failed to receive MergeQueue"))
+            .collect();
+
         let mut buffer = BytesSlab::new(20, refill);
 
         // Where we stash Bytes before handing them off.
@@ -634,21 +794,16 @@ pub mod util {
             stageds.push(Vec::new());
         }
 
-        // Each loop iteration adds to `self.Bytes` and consumes all complete messages.
-        // At the start of each iteration, `self.buffer[..self.length]` represents valid
-        // data, and the remaining capacity is available for reading from the reader.
-        //
-        // Once the buffer fills, we need to copy incomplete messages to a new shared
-        // allocation and place the existing Bytes into `self.in_progress`, so that it
-        // can be recovered once all readers have read what they need to.
-        let mut active = true;
-        while active && node.wait(Duration::from_nanos(500)).is_ok() {
-        // while active {
+        // the callback that is called when a listener has received an event
+        let on_event = |event_attachment_id| {
+            assert!(event_attachment_id == attachment_id);
+            listener
+                .try_wait_all(|_| ())
+                .unwrap();
 
             buffer.ensure_capacity(1);
-            assert!(!buffer.empty().is_empty());
+                assert!(!buffer.empty().is_empty());
 
-            // Attempt to read some more bytes into self.buffer.
             while let Some(slice) = subscriber.receive()
                 .unwrap_or_else(|e| ipc_panic("receiving", e))
             {
@@ -659,8 +814,10 @@ pub mod util {
             }
 
             if buffer.valid().len() == 0 {
-                continue;
+                return CallbackProgression::Continue;
             }
+
+            let mut progression = CallbackProgression::Continue;
 
             // Consume complete messages from the front of self.buffer.
             while let Some(header) = MessageHeader::try_read(buffer.valid()) {
@@ -679,12 +836,12 @@ pub mod util {
                     }
                 }
                 else {
-                    println!("recv-inbox at {}: IPC proc {} told us it finished sending", info.local_process, header.source);
+                    println!("recv-inbox at {}: an IPC proc told us it finished sending", info.local_process);
                     alive_ipc_peers -= 1;
                     if alive_ipc_peers == 0 {
                         println!("recv-inbox at {}: shutting down", info.local_process);
                         // Shutting down; confirm absence of subsequent data.
-                        active = false;
+                        progression = CallbackProgression::Stop;
                         if !buffer.valid().is_empty() {
                             panic!("Clean shutdown followed by data.");
                         }
@@ -699,7 +856,83 @@ pub mod util {
                 use crate::allocator::serializing_allocators::bytes_exchange::BytesPush;
                 targets[index].extend(staged.drain(..));
             }
-        }
+
+            progression
+        };
+
+        waitset.wait_and_process(on_event)
+            .unwrap_or_else(|e| ipc_panic("waiting", e));
+
+        // Each loop iteration adds to `self.Bytes` and consumes all complete messages.
+        // At the start of each iteration, `self.buffer[..self.length]` represents valid
+        // data, and the remaining capacity is available for reading from the reader.
+        //
+        // Once the buffer fills, we need to copy incomplete messages to a new shared
+        // allocation and place the existing Bytes into `self.in_progress`, so that it
+        // can be recovered once all readers have read what they need to.
+        // let mut active = true;
+        // // while active && node.wait(Duration::from_nanos(500)).is_ok() {
+        // while active {
+
+        //     buffer.ensure_capacity(1);
+        //     assert!(!buffer.empty().is_empty());
+
+        //     let Some(_) = listener.blocking_wait_one()
+        //         .unwrap_or_else(|e| ipc_panic("waiting for notification", e))
+        //     else { continue };
+
+        //     // Attempt to read some more bytes into self.buffer.
+        //     while let Some(slice) = subscriber.receive()
+        //         .unwrap_or_else(|e| ipc_panic("receiving", e))
+        //     {
+        //         let present = buffer.valid().len();
+        //         buffer.ensure_capacity(present + slice.payload().len());
+        //         buffer.empty()[..slice.payload().len()].copy_from_slice(slice.payload());
+        //         buffer.make_valid(slice.payload().len());
+        //     }
+
+        //     if buffer.valid().len() == 0 {
+        //         continue;
+        //     }
+
+        //     // Consume complete messages from the front of self.buffer.
+        //     while let Some(header) = MessageHeader::try_read(buffer.valid()) {
+        //         // TODO: Consolidate message sequences sent to the same worker?
+        //         let peeled_bytes = header.required_bytes();
+        //         let bytes = buffer.extract(peeled_bytes);
+
+        //         // Record message receipt.
+        //         logger.as_mut().map(|logger| {
+        //             logger.log(MessageEvent { is_send: false, header, });
+        //         });
+
+        //         if header.length > 0 {
+        //             for target in header.target_lower .. header.target_upper {
+        //                 stageds[target - info.local_process * info.threads_per_process].push(bytes.clone());
+        //             }
+        //         }
+        //         else {
+        //             println!("recv-inbox at {}: IPC proc {} told us it finished sending", info.local_process, header.source);
+        //             alive_ipc_peers -= 1;
+        //             if alive_ipc_peers == 0 {
+        //                 println!("recv-inbox at {}: shutting down", info.local_process);
+        //                 // Shutting down; confirm absence of subsequent data.
+        //                 active = false;
+        //                 if !buffer.valid().is_empty() {
+        //                     panic!("Clean shutdown followed by data.");
+        //                 }
+        //                 buffer.ensure_capacity(1);
+        //             }
+        //         }
+        //     }
+
+        //     // Pass bytes along to targets.
+        //     for (index, staged) in stageds.iter_mut().enumerate() {
+        //         // FIXME: try to merge `staged` before handing it to BytesPush::extend
+        //         use crate::allocator::serializing_allocators::bytes_exchange::BytesPush;
+        //         targets[index].extend(staged.drain(..));
+        //     }
+        // }
 
         // Log the send thread's end.
         logger.as_mut().map(|l| l.log(StateEvent { 
@@ -713,27 +946,28 @@ pub mod util {
     /// Wrapper to make Publisher compatible with std::io::Write
     pub struct PublisherWriter {
         publisher: Publisher<ipc::Service, [u8], ()>,
+        notifier: Notifier<ipc::Service>,
     }
 
     impl PublisherWriter {
         /// Creates a new writer that writes into the publisher by loaning
         /// a shared memory slice of exactly the necessary size and then sending it.
-        pub fn new(publisher: Publisher<ipc::Service, [u8], ()>) -> Self {
-            Self { publisher }
+        pub fn new(publisher: Publisher<ipc::Service, [u8], ()>, notifier: Notifier<ipc::Service>) -> Self {
+            Self { publisher, notifier }
         }
     }
 
     impl Write for PublisherWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            // 1. Loan a slice of the exact size needed
             let mut sample = self.publisher.loan_slice(buf.len())
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
-            // 2. Copy the buffered data into shared memory
             sample.payload_mut().copy_from_slice(buf);
 
-            // 3. Send (triggers notification)
             sample.send()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+
+            self.notifier.notify()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
             Ok(buf.len())
@@ -749,6 +983,7 @@ pub mod util {
     fn ipc_send_loop(
         mut sources: Vec<MergeQueue>,
         publisher: Publisher<ipc::Service, [u8], ()>,
+        notifier: Notifier<ipc::Service>,
         info: ConnectionInfo,
         logger_: Option<Logger<CommunicationEventBuilder>>
     ) {
@@ -761,7 +996,7 @@ pub mod util {
             start: true, 
         }));
 
-        let mut writer = ::std::io::BufWriter::with_capacity(1 << 16, PublisherWriter::new(publisher));
+        let mut writer = ::std::io::BufWriter::with_capacity(1 << 16, PublisherWriter::new(publisher, notifier));
         let mut stash = Vec::new();
 
         while !sources.is_empty() {
@@ -809,7 +1044,12 @@ pub mod util {
                     });
 
                     // writer.write_all(&bytes).expect("failed to write data into IPC memory slice");
-                    writer.write_all(&bytes).expect("failed to write data into IPC memory slice");
+                    writer.write_all(&bytes)
+                        .unwrap_or_else(|e| ipc_panic("writing into shared memory slice", e));
+                    // writer.flush()
+                    //     .unwrap_or_else(|e| ipc_panic("flushing", e));
+                    // notifier.notify()
+                    //     .unwrap_or_else(|e| ipc_panic("notifying", e));
 
                     // let slice = publisher.loan_slice_uninit(bytes.len())
                     //     .unwrap_or_else(|e| ipc_panic("allocating slice", e));
@@ -846,6 +1086,8 @@ pub mod util {
             .unwrap_or_else(|e| ipc_panic("writing data", e));
 
         writer.flush().expect("failed to flush IPC publisher");
+        // notifier.notify()
+                        // .unwrap_or_else(|e| ipc_panic("notifying", e));
 
         logger.as_mut().map(|logger| logger.log(MessageEvent { is_send: true, header }));
 

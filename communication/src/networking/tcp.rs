@@ -74,12 +74,12 @@ pub fn start_connections_tcp(
                 Ok(mut stream) => {
                     stream.set_nodelay(true).expect("set_nodelay call failed");
                     stream.write_u64::<ByteOrder>(HANDSHAKE_MAGIC).expect("failed to encode/send handshake magic");
-                    stream.write_u64::<ByteOrder>(my_index as u64).expect("failed to encode/send worker index");
-                    if noisy { println!("worker {}:\tconnection to worker {}", my_index, address); }
+                    stream.write_u64::<ByteOrder>(my_index as u64).expect("failed to encode/send process index");
+                    if noisy { println!("process {}:\tconnection to process {}", my_index, address); }
                     break stream;
                 },
                 Err(error) => {
-                    println!("worker {}:\terror connecting to worker {}: {}; retrying", my_index, address, error);
+                    println!("process {}:\terror connecting to process {}: {}; retrying", my_index, address, error);
                     thread::sleep(Duration::from_secs(1));
                 },
             }
@@ -110,9 +110,9 @@ pub fn await_connections_tcp(
             return Err(io::Error::new(io::ErrorKind::InvalidData,
                 "received incorrect timely handshake"));
         }
-        let identifier = cursor.read_u64::<ByteOrder>().expect("failed to decode worker index") as usize;
+        let identifier = cursor.read_u64::<ByteOrder>().expect("failed to decode process index") as usize;
         results[identifier - my_index - 1] = Some(stream);
-        if noisy { println!("worker {}:\tconnection from worker {}", my_index, identifier); }
+        if noisy { println!("process {}:\tconnection from process {}", my_index, identifier); }
     }
 
     Ok(results.into_iter().flatten().collect())
@@ -261,6 +261,7 @@ pub fn send_loop<S: Stream>(
     }));
 
     let mut writer = ::std::io::BufWriter::with_capacity(1 << 16, writer);
+    // let mut writer = writer;
     let mut stash = Vec::new();
 
     while !sources.is_empty() {

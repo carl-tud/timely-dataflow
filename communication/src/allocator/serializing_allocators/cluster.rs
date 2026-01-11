@@ -142,7 +142,6 @@ impl<A: Allocate> Allocate for IntraClusterAllocator<A> {
     fn index(&self) -> usize { self.index }
     fn peers(&self) -> usize { self.peers }
     fn allocate<T: Exchangeable>(&mut self, identifier: usize) -> (Vec<Box<dyn Push<T>>>, Box<dyn Pull<T>>) {
-        println!("intra-cluster communication channel: allocating");
         // Assume and enforce in-order identifier allocation.
         if let Some(bound) = self.channel_id_bound {
             assert!(bound < identifier);
