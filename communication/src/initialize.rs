@@ -450,6 +450,8 @@ where
 {
     let logic = Arc::new(func);
     let mut guards = Vec::new();
+    #[cfg(feature = "measure")]
+    let start = std::time::Instant::now();
     for (index, builder) in builders.into_iter().enumerate() {
         let clone = Arc::clone(&logic);
         guards.push(thread::Builder::new()
@@ -461,13 +463,19 @@ where
                             .map_err(|e| format!("{:?}", e))?);
     }
 
-    Ok(WorkerGuards { guards, others })
+    Ok(WorkerGuards { 
+        guards, others, 
+        #[cfg(feature = "measure")]
+        start 
+    })
 }
 
 /// Maintains `JoinHandle`s for worker threads.
 pub struct WorkerGuards<T:'static> {
     guards: Vec<::std::thread::JoinHandle<T>>,
     others: Box<dyn Any>,
+    #[cfg(feature = "measure")]
+    start: std::time::Instant,
 }
 
 impl<T:Send+'static> WorkerGuards<T> {
@@ -495,6 +503,11 @@ impl<T:'static> Drop for WorkerGuards<T> {
     fn drop(&mut self) {
         for guard in self.guards.drain(..) {
             guard.join().expect("Worker panic");
+        }
+        #[cfg(feature = "measure")]
+        {
+            let duration = self.start.elapsed();
+            println!("duration_us={}\nduration_human={:?}", duration.as_micros(), duration);
         }
         // println!("WORKER THREADS JOINED");
     }

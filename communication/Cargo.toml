@@ -18,6 +18,7 @@ workspace = true
 
 [features]
 default = ["getopts"]
+measure = []
 
 [dependencies]
 columnar = { workspace = true }
