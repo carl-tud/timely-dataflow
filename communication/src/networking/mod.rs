@@ -836,10 +836,10 @@ pub mod util {
                     }
                 }
                 else {
-                    println!("recv-inbox at {}: an IPC proc told us it finished sending", info.local_process);
+                    // println!("recv-inbox at {}: an IPC proc told us it finished sending", info.local_process);
                     alive_ipc_peers -= 1;
                     if alive_ipc_peers == 0 {
-                        println!("recv-inbox at {}: shutting down", info.local_process);
+                        // println!("recv-inbox at {}: shutting down", info.local_process);
                         // Shutting down; confirm absence of subsequent data.
                         progression = CallbackProgression::Stop;
                         if !buffer.valid().is_empty() {
