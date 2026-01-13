@@ -81,8 +81,10 @@ zero_prefixed_literal = "warn"
 
 [profile.release]
 opt-level = 3
-debug = true
-rpath = false
+debug = false
+#rpath = false
 # Disable LTO because it causes erratic behavior in Rust 1.53
-#lto = true
+lto = true
 debug-assertions = false
+codegen-units = 1     # Reduce the number of code generation units, increasing optimization time but improving performance
+panic = "abort"       # Use 'abort' instead of 'unwind' for panic handling
