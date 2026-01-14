@@ -71,5 +71,5 @@ if [[ -n "$output_template" ]]; then
 
     "${final_cmd[@]}" > "$output_file"
 else
-    exec "${final_cmd[@]}"
+    "${final_cmd[@]}"
 fi

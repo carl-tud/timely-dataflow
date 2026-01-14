@@ -56,7 +56,7 @@ format_array() {
 }
 
 for ((i=0; i<iterations; i++)); do
-    output=$("${run_cmd[@]}" 2>&1)
+    output=$("${run_cmd[@]}")
     
     if [ "$metric" == "time" ]; then
         # Parse Duration
@@ -80,6 +80,8 @@ for ((i=0; i<iterations; i++)); do
         sr=$(extract_values "$output" "memory_stack_resident_bytes")
         mem_sr_runs+="$(format_array "$sr"), "
     fi
+
+    sleep 1
 done
 
 # Clean trailing commas
