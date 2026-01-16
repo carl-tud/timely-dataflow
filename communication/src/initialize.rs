@@ -42,8 +42,11 @@ impl FromStr for ClusterTransport {
     type Err = &'static str;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            #[cfg(feature = "tcp")]
             "tcp" | "TCP" => Ok(Self::TCP),
+            #[cfg(feature = "quic")]
             "quic" | "QUIC" => Ok(Self::QUIC),
+            #[cfg(feature = "tls")]
             "tls" | "TLS" => Ok(Self::TLS),
             _ => Err("Unknown cluster transport identifier")
         }
@@ -120,9 +123,10 @@ impl Config {
         opts.optopt("p", "process", "identity of this process", "IDX");
         opts.optopt("n", "processes", "number of processes", "NUM");
         opts.optopt("h", "hostfile", "text file whose lines are process addresses", "FILE");
-        opts.optopt("t", "transport", "cluster transport", "tcp|quic");
+        opts.optopt("t", "transport", "cluster transport", "tcp|tls|quic");
         opts.optflag("r", "report", "reports connection progress");
         opts.optflag("z", "zerocopy", "enable zero-copy for intra-process communication");
+        #[cfg(feature = "shared-memory")]
         opts.optflag("s", "sharedmemory", "enable zero-copy for intra-host communication using shared memory");
     }
 
@@ -141,7 +145,10 @@ impl Config {
         let processes = matches.opt_get_default("n", 1_usize).map_err(|e| e.to_string())?;
         let report = matches.opt_present("report");
         let intra_process_zero_copy = matches.opt_present("zerocopy");
+        #[cfg(feature = "shared-memory")]
         let intra_host_zero_copy = matches.opt_present("sharedmemory");
+        #[cfg(not(feature = "shared-memory"))]
+        let intra_host_zero_copy = false;
         let transport = matches.opt_get_default("transport", ClusterTransport::TCP)?;
 
         if processes > 1 {
@@ -219,6 +226,7 @@ impl Config {
             Config::ProcessBinary(threads) => {
                 Ok((IntraProcessSerializingAllocatorBuilder::new_vector(threads, refill).into_iter().map(GenericBuilder::IntraProcessSerializing).collect(), Box::new(())))
             },
+            #[cfg(feature = "tcp")]
             Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: false, intra_host_zero_copy, transport: ClusterTransport::TCP, log_fn } => {
                 match tcp::init::<IntraProcessAllocator>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
@@ -227,6 +235,7 @@ impl Config {
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             },
+            #[cfg(feature = "tcp")]
             Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: true, intra_host_zero_copy, transport: ClusterTransport::TCP,log_fn } => {
                 match tcp::init::<IntraProcessSerializingAllocatorBuilder>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
@@ -235,6 +244,7 @@ impl Config {
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             }
+            #[cfg(feature = "tls")]
             Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: false, intra_host_zero_copy, transport: ClusterTransport::TLS, log_fn } => {
                 match tls::init::<IntraProcessAllocator>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
@@ -243,6 +253,7 @@ impl Config {
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             },
+            #[cfg(feature = "tls")]
             Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: true, intra_host_zero_copy, transport: ClusterTransport::TLS,log_fn } => {
                 match tls::init::<IntraProcessSerializingAllocatorBuilder>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
@@ -251,6 +262,7 @@ impl Config {
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             }
+            #[cfg(feature = "quic")]
             Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: false, intra_host_zero_copy, transport: ClusterTransport::QUIC, log_fn } => {
                 match quic::init::<IntraProcessAllocator>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
@@ -259,6 +271,7 @@ impl Config {
                     Err(err) => Err(format!("failed to initialize networking: {}", err))
                 }
             }
+            #[cfg(feature = "quic")]
             Config::Cluster { threads, process, addresses, report, intra_process_zero_copy: true, intra_host_zero_copy, transport: ClusterTransport::QUIC, log_fn } => {
                 match quic::init::<IntraProcessSerializingAllocatorBuilder>(addresses, process, threads, intra_host_zero_copy, report, refill, log_fn) {
                     Ok((stuff, guard)) => {
