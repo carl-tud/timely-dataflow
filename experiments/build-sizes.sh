@@ -12,16 +12,22 @@ OS="$(uname)"
 
 size_json() {
     CARGO_TARGET_DIR=$TARGET_DIR cargo build --release $1 --example pagerank
-    s=$(size $TARGET_DIR/release/examples/pagerank)
     if [ "$OS" = "Darwin" ]; then
-        echo "$s" | awk 'NR==2 { print "{ ram: " $2 ", rom: " $1 " }" }'
+        size -m $TARGET_DIR/release/examples/pagerank | awk '
+            /Segment __TEXT:/ { rom += $3 }
+            /Segment __DATA_CONST:/ { ram += $3 }
+            /Segment __LINKEDIT:/ { rom += $3 }
+            /Segment __DATA:/ { ram += $3 }
+            END {
+                print "{ ram: " ram ", rom: " rom " }"
+            }'
     else
-        echo "$s" | awk 'NR==2 { print "{ ram: " $2 + $3 ", rom: " $1 + $2 " }" }'
+        size $TARGET_DIR/release/examples/pagerank | awk 'NR==2 { print "{ ram: " $2 + $3 ", rom: " $1 + $2 " }" }'
     fi
 }
 
 baseline=$(size_json "")
-with_shmem=$(size_json "--features shared-memory")
+with_shmem=$(size_json "--features shared-memory,tcp")
 with_tcp=$(size_json "--features tcp")
 with_tls=$(size_json "--features tls")
 with_quic=$(size_json "--features quic")
