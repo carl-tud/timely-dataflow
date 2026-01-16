@@ -486,6 +486,7 @@ pub mod util {
         let mut send_guards: Vec<Box<dyn ThreadHandle<_>>> = Vec::with_capacity(processes - 1);
         let mut recv_guards: Vec<Box<dyn ThreadHandle<_>>> = Vec::with_capacity(processes - 1 - saved_network_receivers_ipc_to_net);
 
+        #[cfg(feature = "shared-memory")]
         // IPC
         let (ipc_node, service, services) =
         if !other_ipc_processes.is_empty() && cfg!(feature = "shared-memory") {
@@ -521,6 +522,7 @@ pub mod util {
         // service. In practice, this means they must have entered the subscriber thread and have progressed
         // just until the point where they hand over control to the kernel to get notified when the shared memory
         // file changes.
+        #[cfg(feature = "shared-memory")]
         if cfg!(feature = "shared-memory") {
             if let (Some((inbox, bell)), Some(node)) = (service, ipc_node) {
                 let ipc_futures = futures.next().unwrap();
@@ -625,6 +627,8 @@ pub mod util {
             return (connected.join().unwrap(), accepted.join().unwrap());
         });
         let mut network_connections = network_connections.0?.into_iter().chain(network_connections.1?.into_iter());
+
+        #[cfg(feature = "shared-memory")]
         let mut ipc_services = services.into_iter();
 
         let connections = addresses.iter()
@@ -635,8 +639,13 @@ pub mod util {
                         assert!(i == my_index);
                         ProcessConnection::LocalProcess
                     }
-                    ProcessConnection::IPC(_) => ProcessConnection::IPC(
-                        ipc_services.next().unwrap()),
+                    
+                    #[cfg(feature = "shared-memory")]
+                    ProcessConnection::IPC(_) => ProcessConnection::IPC(ipc_services.next().unwrap()),
+
+                    #[cfg(not(feature = "shared-memory"))]
+                    ProcessConnection::IPC(_) => ProcessConnection::IPC(()),
+
                     ProcessConnection::Network(_) => ProcessConnection::Network(
                         network_connections.next().expect("network driver did not provide enough connections")),
                 };
@@ -648,8 +657,10 @@ pub mod util {
                 !matches!(connection, ProcessConnection::LocalProcess)) 
             .zip(promises.into_iter())
             .partition(|((_, c), _)| matches!(c, ProcessConnection::Network(_)));
+
         if noisy { println!("process {}:\testablished all ({} IPC, {} network) connections", my_index, ipc_connections.len(), net_connections.len()); }
 
+        #[cfg(feature = "shared-memory")]
         if cfg!(feature = "shared-memory") {
             for ((i, connection), promises) in ipc_connections.into_iter() {
                 let ProcessConnection::IPC((inbox, bell)) = connection else {
