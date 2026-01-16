@@ -424,7 +424,7 @@ pub mod util {
             .map(|(i, &addr)| 
                 if i == my_index { 
                     ProcessConnection::LocalProcess
-                } else if cfg!(feature = "shared-memory") && enable_ipc && addr.ip().is_loopback() {
+                } else if enable_ipc && addr.ip().is_loopback() {
                     ProcessConnection::IPC(addr.port())
                 } else {
                     ProcessConnection::Network(addr)
@@ -489,7 +489,7 @@ pub mod util {
         #[cfg(feature = "shared-memory")]
         // IPC
         let (ipc_node, service, services) =
-        if !other_ipc_processes.is_empty() && cfg!(feature = "shared-memory") {
+        if !other_ipc_processes.is_empty() {
             let node = NodeBuilder::new().create::<ipc::Service>().unwrap();
 
             let service = ipc_service(
@@ -523,79 +523,77 @@ pub mod util {
         // just until the point where they hand over control to the kernel to get notified when the shared memory
         // file changes.
         #[cfg(feature = "shared-memory")]
-        if cfg!(feature = "shared-memory") {
-            if let (Some((inbox, bell)), Some(node)) = (service, ipc_node) {
-                let ipc_futures = futures.next().unwrap();
-                let info = ConnectionInfo {
-                    local_process: my_index,
-                    remote_process: my_index,
-                    total_processes: addresses.len(),
-                    threads_per_process: threads,
-                };
+        if let (Some((inbox, bell)), Some(node)) = (service, ipc_node) {
+            let ipc_futures = futures.next().unwrap();
+            let info = ConnectionInfo {
+                local_process: my_index,
+                remote_process: my_index,
+                total_processes: addresses.len(),
+                threads_per_process: threads,
+            };
 
-                if noisy { println!("process {}:\tcreating thread timely:ipc:recv-inbox for host process", my_index); }
+            if noisy { println!("process {}:\tcreating thread timely:ipc:recv-inbox for host process", my_index); }
 
-                // Assembly is created by the process with the lowest index in the list
-                let create_assembly = my_index < other_ipc_processes.first().unwrap().0;
-                let name = ipc_assembly_name(&instance_hash.to_string());
-                let mut assembly = ipc_assembly(&node, &name, 
-                    other_ipc_processes.len() + 1, 
-                    other_ipc_processes.iter().map(|&(i, _)| i).chain(std::iter::once(my_index)),
-                    create_assembly
-                );
+            // Assembly is created by the process with the lowest index in the list
+            let create_assembly = my_index < other_ipc_processes.first().unwrap().0;
+            let name = ipc_assembly_name(&instance_hash.to_string());
+            let mut assembly = ipc_assembly(&node, &name, 
+                other_ipc_processes.len() + 1, 
+                other_ipc_processes.iter().map(|&(i, _)| i).chain(std::iter::once(my_index)),
+                create_assembly
+            );
 
-                if !create_assembly {
-                    while assembly.is_err() {
-                        if noisy { println!("process {}:\twaiting for process {} to create assembly service {}", 
-                            my_index, other_ipc_processes.first().unwrap().0, name); }
+            if !create_assembly {
+                while assembly.is_err() {
+                    if noisy { println!("process {}:\twaiting for process {} to create assembly service {}", 
+                        my_index, other_ipc_processes.first().unwrap().0, name); }
 
-                        std::thread::sleep(Duration::from_millis(200));
-                        assembly = ipc_assembly(&node, &name, 
-                            other_ipc_processes.len() + 1, 
-                            other_ipc_processes.iter().map(|&(i, _)| i).chain(std::iter::once(my_index)),
-                            false
-                        )
-                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                    assembly = ipc_assembly(&node, &name, 
+                        other_ipc_processes.len() + 1, 
+                        other_ipc_processes.iter().map(|&(i, _)| i).chain(std::iter::once(my_index)),
+                        false
+                    )
                 }
-
-                if noisy { println!("process {}:\topened assembly service {}", my_index, name); }
-
-                let assembly = assembly.unwrap();
-                let reader = reader(&assembly);
-
-                let log_sender = Arc::clone(&log_sender);
-                let refill = refill.clone();
-                let alive_peers = other_ipc_processes.len();
-                let join_guard = std::thread::Builder::new()
-                // let join_guard = ThreadBuilder::new()
-                    .name(format!("timely:ipc:recv-inbox"))
-                    .spawn(move || {
-                        let logger = log_sender(CommunicationSetup {
-                            process: my_index,
-                            sender: false,
-                            remote: None,
-                        });
-
-                        ipc_receive_loop(
-                            ipc_futures, 
-                            subscriber(inbox), 
-                            listener(bell),
-                            assembly,
-                            info, logger, refill, alive_peers);
-                    }).expect("failed to spawn recv-inbox thread");
-
-                for i in std::iter::once(my_index).chain(other_ipc_processes.iter().map(|&(i, _)| i)) {
-                    if noisy { println!("process {}:\twaiting for process {} to become ready to receive", my_index, i); }
-                    thread::sleep(Duration::from_nanos(100));
-                    while !reader.entry::<bool>(&i)
-                        .map(|h| *h.get())
-                        .unwrap_or(false) {}
-                    if noisy { println!("process {}:\tprocess {} is ready to receive", my_index, i); }
-                }
-
-                if noisy { println!("process {}:\tall IPC processes ready to receive", my_index); }
-                recv_guards.push(Box::new(join_guard));
             }
+
+            if noisy { println!("process {}:\topened assembly service {}", my_index, name); }
+
+            let assembly = assembly.unwrap();
+            let reader = reader(&assembly);
+
+            let log_sender = Arc::clone(&log_sender);
+            let refill = refill.clone();
+            let alive_peers = other_ipc_processes.len();
+            let join_guard = std::thread::Builder::new()
+            // let join_guard = ThreadBuilder::new()
+                .name(format!("timely:ipc:recv-inbox"))
+                .spawn(move || {
+                    let logger = log_sender(CommunicationSetup {
+                        process: my_index,
+                        sender: false,
+                        remote: None,
+                    });
+
+                    ipc_receive_loop(
+                        ipc_futures, 
+                        subscriber(inbox), 
+                        listener(bell),
+                        assembly,
+                        info, logger, refill, alive_peers);
+                }).expect("failed to spawn recv-inbox thread");
+
+            for i in std::iter::once(my_index).chain(other_ipc_processes.iter().map(|&(i, _)| i)) {
+                if noisy { println!("process {}:\twaiting for process {} to become ready to receive", my_index, i); }
+                thread::sleep(Duration::from_nanos(100));
+                while !reader.entry::<bool>(&i)
+                    .map(|h| *h.get())
+                    .unwrap_or(false) {}
+                if noisy { println!("process {}:\tprocess {} is ready to receive", my_index, i); }
+            }
+
+            if noisy { println!("process {}:\tall IPC processes ready to receive", my_index); }
+            recv_guards.push(Box::new(join_guard));
         }
 
         // Network connections
@@ -661,41 +659,39 @@ pub mod util {
         if noisy { println!("process {}:\testablished all ({} IPC, {} network) connections", my_index, ipc_connections.len(), net_connections.len()); }
 
         #[cfg(feature = "shared-memory")]
-        if cfg!(feature = "shared-memory") {
-            for ((i, connection), promises) in ipc_connections.into_iter() {
-                let ProcessConnection::IPC((inbox, bell)) = connection else {
-                    unreachable!("IPC connections filtered")
-                };
-                let info = ConnectionInfo {
-                    local_process: my_index,
-                    remote_process: i,
-                    total_processes: addresses.len(),
-                    threads_per_process: threads,
-                };
+        for ((i, connection), promises) in ipc_connections.into_iter() {
+            let ProcessConnection::IPC((inbox, bell)) = connection else {
+                unreachable!("IPC connections filtered")
+            };
+            let info = ConnectionInfo {
+                local_process: my_index,
+                remote_process: i,
+                total_processes: addresses.len(),
+                threads_per_process: threads,
+            };
 
-                if noisy { println!("process {}:\tcreating thread timely:ipc:send-{i} for host process {}", my_index, i); }
-                let log_sender = Arc::clone(&log_sender);
-                // let join_guard = ThreadBuilder::new()
-                let join_guard = std::thread::Builder::new()
-                    .name(format!("timely:ipc:send-{}", i))
-                    .spawn(move || {
-                        let logger = log_sender(CommunicationSetup {
-                            process: my_index,
-                            sender: true,
-                            remote: Some(i),
-                        });
-                        // Cannot build a refill that allocates shared memory slices...
-                        let sources: Vec<MergeQueue> = promises.into_iter().map(|x| {
-                            let buzzer = crate::buzzer::Buzzer::default();
-                            let queue = MergeQueue::new(buzzer);
-                            x.send((queue.clone(), None)).expect("failed to send MergeQueue");
-                            queue
-                        }).collect();
-                        ipc_send_loop(sources, publisher(inbox), notifier(bell), info, logger);
-                    }).expect("failed to spawn thread");
+            if noisy { println!("process {}:\tcreating thread timely:ipc:send-{i} for host process {}", my_index, i); }
+            let log_sender = Arc::clone(&log_sender);
+            // let join_guard = ThreadBuilder::new()
+            let join_guard = std::thread::Builder::new()
+                .name(format!("timely:ipc:send-{}", i))
+                .spawn(move || {
+                    let logger = log_sender(CommunicationSetup {
+                        process: my_index,
+                        sender: true,
+                        remote: Some(i),
+                    });
+                    // Cannot build a refill that allocates shared memory slices...
+                    let sources: Vec<MergeQueue> = promises.into_iter().map(|x| {
+                        let buzzer = crate::buzzer::Buzzer::default();
+                        let queue = MergeQueue::new(buzzer);
+                        x.send((queue.clone(), None)).expect("failed to send MergeQueue");
+                        queue
+                    }).collect();
+                    ipc_send_loop(sources, publisher(inbox), notifier(bell), info, logger);
+                }).expect("failed to spawn thread");
 
-                send_guards.push(Box::new(join_guard));
-            }
+            send_guards.push(Box::new(join_guard));
         }
 
         for (((i, connection), promises), futures) in net_connections.into_iter().zip(futures) {
